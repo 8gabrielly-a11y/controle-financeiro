@@ -1,0 +1,316 @@
+/** @OnlyCurrentDoc */
+/**
+ * Backend for the private finance app. Deploy as an Apps Script web app
+ * running as the sheet owner. Set API_TOKEN in Script Properties.
+ * The Site server, never the browser, sends API_TOKEN.
+ */
+const COLLECTIONS = Object.freeze({
+  contas: ['Contas', ['id','nome','tipo','saldo_inicial','data_saldo','ativa']],
+  receitas: ['Receitas', ['id','nome','valor_previsto','dia_recebimento','recorrencia','inicio','fim','conta_id','ativa']],
+  cartoes: ['Cartoes', ['id','nome','limite_total','dia_fechamento','dia_vencimento','ativo']],
+  lancamentos: ['Lancamentos', ['id','criado_em','data_compra','descricao','valor','categoria','forma_pagamento','conta_id','cartao_id','parcelas','mes_override','status','observacao']],
+  contas_a_pagar: ['Contas a pagar', ['id','nome','valor_previsto','dia_vencimento','recorrencia','inicio','fim','conta_id','ativa']],
+  pagamentos: ['Pagamentos', ['id','conta_a_pagar_id','data_vencimento','pago_em','valor_pago','status','observacao']],
+  cofrinhos: ['Cofrinhos', ['id','nome','valor_alvo','prazo','prioridade','ativo']],
+  aportes: ['Aportes', ['id','cofrinho_id','data','valor','tipo','conta_id','observacao']]
+});
+
+function respond_(body) {
+  return ContentService.createTextOutput(JSON.stringify(body))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+function text_(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'number' && isFinite(value)) return value;
+  if (typeof value === 'boolean') return value;
+  const stringValue = String(value);
+  return /^[=+@]/.test(stringValue) || /^-[A-Za-z(]/.test(stringValue)
+    ? "'" + stringValue : stringValue;
+}
+
+function output_(value) {
+  if (value instanceof Date) {
+    return Utilities.formatDate(value, 'America/Sao_Paulo', 'yyyy-MM-dd');
+  }
+  return value;
+}
+
+function doPost(e) {
+  if(PropertiesService.getScriptProperties().getProperty('SHEETS_PRIMARY')==='true')return respond_({ok:false,error:'legacy_read_only'});
+  try {
+    const request = JSON.parse(e && e.postData && e.postData.contents || '{}');
+    const props = PropertiesService.getScriptProperties();
+    const token = props.getProperty('API_TOKEN');
+    if (!token) return respond_({ok:false,error:'not_configured'});
+    if (typeof request.token !== 'string' || request.token !== token) {
+      return respond_({ok:false,error:'unauthorized'});
+    }
+    const definition = COLLECTIONS[request.collection];
+    if (!definition) return respond_({ok:false,error:'invalid_collection'});
+    if (!['list','create','update','upsert'].includes(request.action)) {
+      return respond_({ok:false,error:'invalid_action'});
+    }
+    const lock = LockService.getScriptLock();
+    lock.waitLock(15000);
+    try {
+      const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(definition[0]);
+      if (!sheet) return respond_({ok:false,error:'missing_sheet'});
+      const headers = definition[1];
+      const currentHeaders = sheet.getRange(1,1,1,headers.length).getDisplayValues()[0];
+      if (currentHeaders.some((value,index)=>value!==headers[index])) {
+        return respond_({ok:false,error:'schema_mismatch'});
+      }
+      const rowCount = Math.max(0,sheet.getLastRow()-1);
+      const rows = rowCount ? sheet.getRange(2,1,rowCount,headers.length).getValues() : [];
+      if (request.action === 'list') {
+        return respond_({ok:true,records:rows.filter(row=>row[0]).map(row=>Object.fromEntries(headers.map((key,i)=>[key,output_(row[i])])))});
+      }
+      const input = request.record;
+      if (!input || typeof input !== 'object' || Array.isArray(input)) {
+        return respond_({ok:false,error:'invalid_record'});
+      }
+      if (Object.keys(input).some(key=>!headers.includes(key))) {
+        return respond_({ok:false,error:'unknown_field'});
+      }
+      if (request.action === 'upsert') {
+        if (typeof input.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(input.id)) {
+          return respond_({ok:false,error:'invalid_id'});
+        }
+        const index = rows.findIndex(row=>row[0]===input.id);
+        const previous = index<0 ? {} : Object.fromEntries(headers.map((key,i)=>[key,output_(rows[index][i])]));
+        const record = Object.assign({},previous,input);
+        if (index<0) sheet.appendRow(headers.map(key=>text_(record[key])));
+        else sheet.getRange(index+2,1,1,headers.length).setValues([headers.map(key=>text_(record[key]))]);
+        return respond_({ok:true,record:record});
+      }
+      if (request.action === 'create') {
+        if (input.id) return respond_({ok:false,error:'id_must_be_generated'});
+        const id = Utilities.getUuid();
+        const record = Object.assign({},input,{id});
+        if (headers.includes('criado_em') && !record.criado_em) record.criado_em = new Date().toISOString();
+        sheet.appendRow(headers.map(key=>text_(record[key])));
+        return respond_({ok:true,record:record});
+      }
+      const id = text_(request.id);
+      if (!id || input.id && text_(input.id)!==id) return respond_({ok:false,error:'invalid_id'});
+      const index = rows.findIndex(row=>row[0]===id);
+      if (index<0) return respond_({ok:false,error:'not_found'});
+      const existing = Object.fromEntries(headers.map((key,i)=>[key,output_(rows[index][i])]));
+      const updated = Object.assign({},existing,input,{id});
+      sheet.getRange(index+2,1,1,headers.length).setValues([headers.map(key=>text_(updated[key]))]);
+      return respond_({ok:true,record:updated});
+    } finally {
+      lock.releaseLock();
+    }
+  } catch (error) {
+    return respond_({ok:false,error:'request_failed'});
+  }
+}
+
+
+/* CSV statement values are charges for this invoice, never purchase totals. */
+const Statement = (() => {
+  const prefix='FATURA_CSV_V1:';
+  function parseCSV(text,{manual=false}={}){
+    const rows=[];let row=[],cell='',quoted=false;
+    text=String(text).replace(/^\uFEFF/,'');
+    for(let i=0;i<text.length;i++){const c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(cell);cell=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(x=>x.trim()))rows.push(row);row=[];cell=''}else cell+=c}
+    if(quoted)throw Error('O CSV contém aspas sem fechamento.');
+    row.push(cell);if(row.some(x=>x.trim()))rows.push(row);
+    const header=rows.shift()?.map(x=>x.trim().toLowerCase());
+    if(!header||!['date','title','amount'].every(x=>header.includes(x)))throw Error('Use o CSV Nubank com as colunas date, title e amount.');
+    if(!rows.length||rows.length>500)throw Error('Importe de 1 a 500 registros por arquivo.');
+    const occurrences=new Map();
+    return rows.map((cells,index)=>{
+      if(cells.length!==header.length)throw Error('Número de colunas inválido na linha '+(index+2));
+      const date=cells[header.indexOf('date')].trim(),title=cells[header.indexOf('title')].trim(),raw=cells[header.indexOf('amount')].trim();
+      const clean=raw.replace(/\s/g,'');const decimal=clean.includes(',')?clean.replace(/\./g,'').replace(',','.'):clean;
+      if(!/^-?\d+(\.\d{1,2})?$/.test(decimal))throw Error('Valor inválido na linha '+(index+2));
+      const amount=Math.round(Number(decimal)*100)/100;
+      if(!title||(!(manual&&!date)&&(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(Date.parse(date))||new Date(date+'T12:00:00Z').toISOString().slice(0,10)!==date)))throw Error('Data ou descrição inválida na linha '+(index+2));
+      const match=title.match(/\s*-\s*Parcela\s+(\d+)\/(\d+)\s*$/i),current=match?Number(match[1]):1,total=match?Number(match[2]):1;
+      if(current<1||total<current||total>600)throw Error('Parcela inválida na linha '+(index+2));
+      const type=/^Pagamento recebido/i.test(title)?'pagamento':/^Valor pendente do m[eê]s anterior/i.test(title)?'saldo_anterior':/^(Juros|Multa|IOF)\b/i.test(title)?'encargo':amount<0?'estorno':'compra';
+      const base=title.replace(/\s*-\s*Parcela\s+\d+\/\d+\s*$/i,'').trim();
+      const purchaseBase=[date,base.toLowerCase(),total,amount].join('|');const occurrence=(occurrences.get(purchaseBase)||0)+1;occurrences.set(purchaseBase,occurrence);
+      let category=type==='pagamento'?'Pagamento de fatura':type==='saldo_anterior'?'Saldo anterior':type==='encargo'?'Encargos':'';
+      // Only unambiguous merchant types get categories; other purchases remain reviewable.
+      if(type==='compra'){if(/mercado oliveira|zappidelivery/i.test(title))category='Alimentação';else if(/mvmedicos/i.test(title))category='Saúde';else if(/descomplica/i.test(title))category='Educação';else if(/rmdriver/i.test(title))category='Transporte'}
+      const recurrence=manual&&header.includes('recurrence')&&cells[header.indexOf('recurrence')].trim()==='monthly'?'monthly':'';if(manual&&header.includes('category')&&cells[header.indexOf('category')].trim()==='Seguros')category='Seguros';
+      return {date,title,amount,raw,current,total,type,category,recurrence,purchaseKey:purchaseBase+'|'+occurrence,occurrence,line:index+2};
+    });
+  }
+  function summary(rows){const sums={total:0,compras:0,encargos:0,saldoAnterior:0,pagamentos:0,estornos:0,count:rows.length,parceladas:0,pendentes:0};for(const r of rows){const cents=Math.round(r.amount*100);sums.total+=cents;if(r.type==='compra')sums.compras+=cents;if(r.type==='encargo')sums.encargos+=cents;if(r.type==='saldo_anterior')sums.saldoAnterior+=cents;if(r.type==='pagamento')sums.pagamentos+=cents;if(r.type==='estorno')sums.estornos+=cents;if(r.total>1)sums.parceladas++;if(!r.category)sums.pendentes++}for(const k of ['total','compras','encargos','saldoAnterior','pagamentos','estornos'])sums[k]/=100;return sums}
+  function meta(note){try{return typeof note==='string'&&note.startsWith(prefix)?JSON.parse(note.slice(prefix.length)):null}catch{return null}}
+  function note(data){return prefix+JSON.stringify(data)}
+  function monthShift(month,n){const [y,m]=month.split('-').map(Number);const date=new Date(Date.UTC(y,m-1+n,1));return date.toISOString().slice(0,7)}
+  function dueAt(month,day){const [y,m]=month.split('-').map(Number);return month+'-'+String(Math.min(day,new Date(Date.UTC(y,m,0)).getUTCDate())).padStart(2,'0')}
+  function schedule(record,card,all,targetMonth){const data=record.importData||meta(record.note);if(!data)return null;const month=data.dueDate.slice(0,7),count=data.recurrence==='monthly'?Math.max(1,Math.min(600,(Number((targetMonth||month).slice(0,4))-Number(month.slice(0,4)))*12+Number((targetMonth||month).slice(5))-Number(month.slice(5))+1)):data.type==='compra'?data.total-data.current+1:1;
+    return Array.from({length:count},(_,i)=>{const target=monthShift(month,i);const actual=i>0&&all.some(other=>{const m=other.importData||meta(other.note);return other!==record&&other.card===record.card&&m&&(m.purchaseKey===data.purchaseKey||data.recurrence==='monthly'&&String(m.originalTitle||other.description).trim().toLowerCase()===String(data.originalTitle||record.description).trim().toLowerCase())&&m.dueDate.slice(0,7)===target});if(actual)return null;return {number:data.current+i,amount:record.value,dueDate:dueAt(target,Number(data.dueDate.slice(8))),projected:i>0,type:data.type}}).filter(Boolean);
+  }
+  return {parseCSV,summary,meta,note,monthShift,dueAt,schedule};
+})();
+if(typeof window!=='undefined')window.Statement=Statement;
+
+
+function importStatement(input,owner,env){
+  const cardName=String(input.cardName||'').trim(),dueDate=String(input.dueDate||''),closingDay=Number(input.closingDay);
+  if(!cardName||cardName.length>80||!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)||!Number.isFinite(Date.parse(dueDate))||new Date(dueDate+'T12:00:00Z').toISOString().slice(0,10)!==dueDate||!Number.isInteger(closingDay)||closingDay<1||closingDay>31)return json({ok:false,error:'Confira cartão, vencimento e fechamento.'},400);
+  let rows;try{rows=Statement.parseCSV(input.csv,{manual:input.manual===true})}catch(e){return json({ok:false,error:e.message},400)}
+  const db=env.DB,month=dueDate.slice(0,7),now=new Date().toISOString();
+  const existingCards=db.prepare("SELECT payload FROM finance_records WHERE owner = ? AND collection = 'cartoes'").bind(owner).all();
+  const previous=existingCards.results.map(x=>JSON.parse(x.payload)).find(x=>x.nome.toLowerCase()===cardName.toLowerCase()&&x.ativo!=='false');
+  const card={...previous,id:previous?.id||stableUUID(owner+'|card|'+cardName.toLowerCase()),nome:cardName,limite_total:previous?.limite_total??'',dia_fechamento:closingDay,dia_vencimento:Number(dueDate.slice(8)),ativo:'true'};
+  const existing=db.prepare("SELECT id,payload FROM finance_records WHERE owner = ? AND collection = 'lancamentos'").bind(owner).all();
+  const known=new Map(existing.results.map(x=>[x.id,JSON.parse(x.payload)]));const records=[];let created=0;
+  for(const row of rows){const id=stableUUID(owner+'|statement|'+cardName.toLowerCase()+'|'+dueDate+'|'+row.date+'|'+row.title+'|'+row.amount+'|'+row.occurrence);
+    const prior=[...known.values()].find(r=>{const m=Statement.meta(r.observacao);return r.cartao_id.toLowerCase()===cardName.toLowerCase()&&m&&m.dueDate===dueDate&&m.purchaseKey===row.purchaseKey});if(prior){records.push(prior);continue}
+    const data={dueDate,current:row.current,total:row.total,type:row.type,purchaseKey:row.purchaseKey,source:input.manual===true?'Informado pela usuária':'CSV de fatura',recurrence:row.recurrence||'',sourceLine:row.line,originalTitle:row.title,originalDate:row.date,originalAmount:row.raw,note:''};
+    records.push({id,criado_em:now,data_compra:row.date,descricao:row.title,valor:row.amount,categoria:row.category,forma_pagamento:'Cartão de crédito',conta_id:'',cartao_id:card.nome,parcelas:row.total,mes_override:month,status:row.category?'completo':'incompleto',observacao:Statement.note(data)});created++;
+  }
+  const statements=[db.prepare("INSERT INTO finance_records (owner,collection,id,payload,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(owner,collection,id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at").bind(owner,'cartoes',card.id,JSON.stringify(card),now),...records.filter(r=>!known.has(r.id)).map(r=>db.prepare('INSERT INTO finance_records (owner,collection,id,payload,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(owner,collection,id) DO NOTHING').bind(owner,'lancamentos',r.id,JSON.stringify(r),now))];
+  db.batch(statements);
+  const items=[{collection:'cartoes',record:card},...records.map(record=>({collection:'lancamentos',record}))];const synced=syncRecords(env,items);
+  return json({ok:true,created,skipped:rows.length-created,total:rows.length,month,summary:Statement.summary(rows),sheetSynced:synced===items.length,synced});
+}
+function baseProfile(input,owner,env){
+  const date=String(input.referenceDate||'');if(!/^\d{4}-\d{2}-\d{2}$/.test(date)||!Number.isFinite(Date.parse(date))||new Date(date+'T12:00:00Z').toISOString().slice(0,10)!==date)return json({ok:false,error:'Informe uma data de referência válida.'},400);
+  for(const key of ['cash','income','flashReload','flashBalance','rent','loan','limitNubank','limitSantander','limitC6'])if(input[key]!==undefined&&(!Number.isFinite(input[key])||input[key]<0))return json({ok:false,error:'Confira os valores informados.'},400);
+  for(const key of ['incomeDay','flashDay','rentDay','loanDay','loanFirstDay','loanSecondDay'])if(input[key]!==undefined&&!(key==='incomeDay'&&/^([1-9]|1\d|2[0-3])_util$/.test(String(input[key])))&&(!Number.isInteger(input[key])||input[key]<1||input[key]>31))return json({ok:false,error:'Dia de vencimento ou recebimento inválido.'},400);
+  if(input.splitLoan===true&&(![input.loanFirstAmount,input.loanSecondAmount].every(n=>Number.isFinite(n)&&n>0)||![input.loanFirstDay,input.loanSecondDay].every(n=>Number.isInteger(n)&&n>=1&&n<=31)||input.loan!==undefined&&Math.round((input.loanFirstAmount+input.loanSecondAmount)*100)!==Math.round(input.loan*100)))return json({ok:false,error:'As duas partes do empréstimo devem somar o total mensal.'},400);
+  if(input.loanLastMonth!==undefined&&!/^\d{4}-(0[1-9]|1[0-2])$/.test(input.loanLastMonth))return json({ok:false,error:'Mês da última parcela inválido.'},400);
+  const db=env.DB,month=date.slice(0,7),now=new Date().toISOString(),existing=(db.prepare("SELECT collection,payload FROM finance_records WHERE owner = ? AND collection IN ('contas','receitas','contas_a_pagar','cartoes','pagamentos')").bind(owner).all()).results.map(x=>({collection:x.collection,record:JSON.parse(x.payload)}));
+  const rows=[];function put(collection,key,previous,patch){const record={...previous,...patch,id:previous?.id||stableUUID(owner+'|base|'+collection+'|'+key)};rows.push({collection,record});return record}
+  const find=(collection,predicate)=>existing.find(x=>x.collection===collection&&predicate(x.record))?.record;
+  if(input.cash!==undefined){const previous=find('contas',x=>x.tipo==='corrente'&&x.ativa!=='false');put('contas','cash',previous,{nome:previous?.nome||'Dinheiro disponível informado',tipo:'corrente',saldo_inicial:input.cash,data_saldo:date,ativa:'true'})}
+  if(input.flashBalance!==undefined){const previous=find('contas',x=>x.tipo==='beneficio'&&x.ativa!=='false');put('contas','flash',previous,{nome:'Flash',tipo:'beneficio',saldo_inicial:input.flashBalance,data_saldo:date,ativa:'true'})}
+  if(input.income!==undefined){const previous=find('receitas',x=>x.ativa!=='false'&&String(x.recorrencia).startsWith('monthly')&&x.conta_id!=='beneficio:flash'&&!/flash/i.test(x.nome));put('receitas','income',previous,{nome:'Renda mensal estimada',valor_previsto:input.income,dia_recebimento:input.incomeDay??previous?.dia_recebimento??'',recorrencia:'monthly_variable',inicio:previous?.inicio||month,ativa:'true'})}
+  if(input.flashReload!==undefined){const previous=find('receitas',x=>x.ativa!=='false'&&(x.conta_id==='beneficio:flash'||/flash/i.test(x.nome)));put('receitas','flash-reload',previous,{nome:'Recarga Flash estimada',valor_previsto:input.flashReload,dia_recebimento:input.flashDay??previous?.dia_recebimento??'',recorrencia:'monthly_variable',inicio:previous?.inicio||month,conta_id:'beneficio:flash',ativa:'true'})}
+  for(const [key,title,dayKey,cadence]of [['rent','Aluguel','rentDay','monthly_variable'],['loan','Empréstimo','loanDay','monthly_fixed']]){if(input[key]===undefined||key==='loan'&&input.splitLoan===true)continue;const previous=find('contas_a_pagar',x=>x.nome===title&&x.ativa!=='false');const bill=put('contas_a_pagar',key,previous,{nome:title,valor_previsto:input[key],dia_vencimento:input[dayKey]??previous?.dia_vencimento??'',recorrencia:cadence,inicio:previous?.inicio||month,fim:key==='loan'?(input.loanLastMonth??previous?.fim??''):'',ativa:'true'});const priorPayment=find('pagamentos',x=>x.conta_a_pagar_id===bill.id&&String(x.data_vencimento).slice(0,7)===month);const due=bill.dia_vencimento?Statement.dueAt(month,Number(bill.dia_vencimento)):month;if(!priorPayment||input[dayKey]!==undefined||key==='rent'&&input.rentUnpaid===true){put('pagamentos',bill.id+'|'+month,priorPayment,{conta_a_pagar_id:bill.id,data_vencimento:due,pago_em:priorPayment?.pago_em||'',valor_pago:priorPayment?.valor_pago??'',status:key==='rent'&&input.rentUnpaid===true?'pendente':priorPayment?.status||'a_confirmar',observacao:key==='rent'&&input.rentUnpaid===true?'Aluguel deste mês ainda não pago, conforme informado pela usuária.':priorPayment?.observacao||'Situação do pagamento deste mês ainda não informada.'})}}
+  if(input.splitLoan===true){const original=find('contas_a_pagar',x=>x.nome==='Empréstimo'&&x.ativa!=='false');if(original){put('contas_a_pagar','loan',original,{ativa:'false'});const originalPayment=find('pagamentos',x=>x.conta_a_pagar_id===original.id&&String(x.data_vencimento).slice(0,7)===month);if(originalPayment&&originalPayment.status!=='pago')put('pagamentos',original.id+'|'+month,originalPayment,{status:'substituido',observacao:'Compromisso desmembrado em dois vencimentos, sem duplicar o total mensal.'})}
+    for(const [index,amount,day]of [[1,input.loanFirstAmount,input.loanFirstDay],[2,input.loanSecondAmount,input.loanSecondDay]]){const title='Empréstimo — parte '+index,previous=find('contas_a_pagar',x=>x.nome===title&&x.ativa!=='false');const bill=put('contas_a_pagar','loan-part-'+index,previous,{nome:title,valor_previsto:amount,dia_vencimento:day,recorrencia:'monthly_fixed',inicio:previous?.inicio||original?.inicio||month,fim:input.loanLastMonth??previous?.fim??original?.fim??'',ativa:'true'});const priorPayment=find('pagamentos',x=>x.conta_a_pagar_id===bill.id&&String(x.data_vencimento).slice(0,7)===month);put('pagamentos',bill.id+'|'+month,priorPayment,{conta_a_pagar_id:bill.id,data_vencimento:Statement.dueAt(month,day),pago_em:priorPayment?.pago_em||'',valor_pago:input.loanPaid===true?amount:priorPayment?.valor_pago??'',status:input.loanPaid===true?'pago':priorPayment?.status||'a_confirmar',observacao:input.loanPaid===true?'Pagamento de novembro confirmado pela usuária. Data efetiva não informada.':priorPayment?.observacao||'Situação do pagamento do mês a confirmar.'})}}
+  for(const [key,name]of [['limitNubank','Nubank'],['limitSantander','Santander'],['limitC6','C6']]){if(input[key]===undefined)continue;const card=find('cartoes',x=>x.nome.toLowerCase()===name.toLowerCase()&&x.ativo!=='false');if(!card)return json({ok:false,error:'Cadastre primeiro o cartão '+name+'.'},400);put('cartoes',name,card,{limite_total:input[key]})}
+  if(!rows.length)return json({ok:false,error:'Preencha ao menos um valor.'},400);
+  db.batch(rows.map(({collection,record})=>db.prepare('INSERT INTO finance_records (owner,collection,id,payload,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(owner,collection,id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at').bind(owner,collection,record.id,JSON.stringify(record),now)));
+  const synced=syncRecords(env,rows);return json({ok:true,saved:rows.length,sheetSynced:synced===rows.length});
+}
+
+
+/** @OnlyCurrentDoc */
+// Run once from the editor, in the existing spreadsheet-bound project.
+function configurarControle() {
+  const email=Session.getEffectiveUser().getEmail().toLowerCase();
+  if(!email)throw Error('Entre na sua conta Google.');
+  const props=PropertiesService.getScriptProperties();
+  const previous=props.getProperty('FINANCE_OWNER_EMAIL');
+  if(previous&&previous!==email)throw Error('Somente a proprietária pode configurar.');
+  props.setProperties({FINANCE_OWNER_EMAIL:email,FINANCE_APP_URL:'https://8gabrielly-a11y.github.io/controle-financeiro/controle/app/index.html'});
+  Object.keys(COLLECTIONS).forEach(collection=>sheet_(collection));
+  console.log('Configuração concluída. Publique como usuário que acessa, somente você.');
+}
+function owner_(){
+  const expected=PropertiesService.getScriptProperties().getProperty('FINANCE_OWNER_EMAIL');
+  const email=Session.getActiveUser().getEmail().toLowerCase();
+  if(!expected||!email||email!==expected)throw Error('Acesso restrito à proprietária.');
+  return email;
+}
+function appUrl_(){
+  const url=PropertiesService.getScriptProperties().getProperty('FINANCE_APP_URL')||'';
+  if(!/^https:\/\/[a-z0-9-]+\.github\.io\/[^?#]+\/app\/index\.html$/.test(url))throw Error('Configure FINANCE_APP_URL com a página do GitHub.');
+  return url;
+}
+function doGet(){
+  owner_();
+  const template=HtmlService.createTemplate(FINANCE_BRIDGE_TEMPLATE_);
+  template.appUrl=appUrl_();
+  return template.evaluate().setTitle('Controle financeiro · Bia');
+}
+function financeApi(request){
+  const owner=owner_();
+  if(!request||typeof request!=='object'||JSON.stringify(request).length>220000)throw Error('Pedido inválido.');
+  const lock=LockService.getScriptLock();lock.waitLock(15000);
+  try{
+    if(request.path==='/api/status')return {connected:true,sheetConnected:true,storage:'sheets'};
+    if(request.path==='/api/sync'){
+      const counts={};Object.keys(COLLECTIONS).forEach(k=>counts[k]=readCollection_(k).length);
+      return {ok:true,counts,source:'Google Sheets'};
+    }
+    if(request.path==='/api/sheets')return sheetRequest_(request.body||{});
+    const env={DB:sheetDatabase_()};
+    if(request.path==='/api/base-profile')return baseProfile(request.body||{},owner,env);
+    if(request.path==='/api/import-statement')return importStatement(request.body||{},owner,env);
+    return {ok:false,error:'Operação não disponível.'};
+  }finally{lock.releaseLock()}
+}
+function sheet_(collection){
+  const definition=COLLECTIONS[collection];if(!definition)throw Error('Coleção inválida.');
+  const sheet=SpreadsheetApp.getActiveSpreadsheet().getSheetByName(definition[0]);
+  if(!sheet)throw Error('Aba ausente: '+definition[0]+'. Use a planilha original; não crie uma base vazia.');
+  const current=sheet.getRange(1,1,1,definition[1].length).getDisplayValues()[0];
+  if(current.some((v,i)=>v!==definition[1][i]))throw Error('Confira os cabeçalhos da aba '+definition[0]+'.');
+  return sheet;
+}
+function normalizeCell_(key,value){
+  const result=typeof value==='boolean'?String(value):output_(value);
+  return ['inicio','fim','prazo','mes_override'].includes(key)&&typeof result==='string'?result.slice(0,7):result;
+}
+function readCollection_(collection){
+  const sheet=sheet_(collection),headers=COLLECTIONS[collection][1],count=sheet.getLastRow()-1;
+  if(count<=0)return [];
+  return sheet.getRange(2,1,count,headers.length).getValues().filter(row=>row[0]).map(row=>Object.fromEntries(headers.map((key,i)=>[key,normalizeCell_(key,row[i])])));
+}
+function upsert_(collection,record,mode){
+  const headers=COLLECTIONS[collection]?.[1];
+  if(!headers||!record||typeof record!=='object'||Array.isArray(record)||!record.id||Object.keys(record).some(key=>!headers.includes(key)))throw Error('Registro inválido.');
+  const sheet=sheet_(collection),count=sheet.getLastRow()-1;
+  const ids=count>0?sheet.getRange(2,1,count,1).getValues().map(row=>row[0]):[];
+  const index=ids.indexOf(record.id);
+  if(index<0&&mode==='update')throw Error('Registro não encontrado.');
+  if(index>=0&&mode==='ignore')return;
+  const priorValues=index<0?[]:sheet.getRange(index+2,1,1,headers.length).getValues()[0];
+  const previous=index<0?{}:Object.fromEntries(headers.map((k,i)=>[k,output_(priorValues[i])]));
+  const saved=Object.assign({},previous,record),values=headers.map(k=>text_(saved[k]));
+  if(index<0)sheet.appendRow(values);else sheet.getRange(index+2,1,1,headers.length).setValues([values]);
+  SpreadsheetApp.flush();return saved;
+}
+function sheetRequest_(input){
+  if(!COLLECTIONS[input.collection])return {ok:false,error:'Coleção inválida.'};
+  if(input.action==='list')return {ok:true,records:readCollection_(input.collection)};
+  if(!['create','update'].includes(input.action))return {ok:false,error:'Operação inválida.'};
+  let record=input.record;if(!record||typeof record!=='object'||Array.isArray(record))return {ok:false,error:'Registro inválido.'};
+  if(input.action==='create'){
+    if(record.id)return {ok:false,error:'ID gerado pelo servidor.'};
+    record=Object.assign({},record,{id:Utilities.getUuid()});
+    if(input.collection==='lancamentos'&&!record.criado_em)record.criado_em=new Date().toISOString();
+  }else{
+    if(!input.id||record.id&&record.id!==input.id)return {ok:false,error:'ID inválido.'};
+    record=Object.assign({},record,{id:input.id});
+  }
+  const saved=upsert_(input.collection,record,input.action==='update'?'update':'upsert');
+  return {ok:true,record:saved,sheetSynced:true};
+}
+function json(value){return value}
+function syncRecords(env,items){SpreadsheetApp.flush();return items.length}
+function stableUUID(value){
+  const bytes=Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256,value,Utilities.Charset.UTF_8).map(n=>(n+256)%256);
+  bytes[6]=(bytes[6]&15)|80;bytes[8]=(bytes[8]&63)|128;
+  const hex=bytes.slice(0,16).map(b=>b.toString(16).padStart(2,'0')).join('');
+  return [hex.slice(0,8),hex.slice(8,12),hex.slice(12,16),hex.slice(16,20),hex.slice(20)].join('-');
+}
+// Adapter limited to prepared statements in Finance.gs; no SQL from browsers.
+function sheetDatabase_(){
+  return {prepare(sql){return {bind(...args){
+    return {all(){
+      const match=sql.match(/collection = '([^']+)'/),names=match?[match[1]]:Object.keys(COLLECTIONS);
+      return {results:names.flatMap(collection=>readCollection_(collection).map(record=>({collection,id:record.id,payload:JSON.stringify(record)})))};
+    },execute(){
+      if(!sql.startsWith('INSERT INTO finance_records '))throw Error('Operação interna inválida.');
+      const collection=args[1],record=JSON.parse(args[3]);
+      upsert_(collection,record,sql.includes('DO NOTHING')?'ignore':'upsert');
+    }};
+  }}},batch(statements){statements.forEach(statement=>statement.execute());return []}};
+}
+
+
+const FINANCE_BRIDGE_TEMPLATE_="<!doctype html><html lang=\"pt-BR\"><head><base target=\"_top\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;height:100%;font:16px system-ui;background:#edf2f7}iframe{width:100%;height:100%;border:0}#status{padding:16px}#status[hidden]{display:none}</style></head><body><p id=\"status\">Conectando à sua planilha…</p><iframe id=\"app\" title=\"Controle financeiro\" allow=\"clipboard-write\"></iframe><script>\nconst appUrl=<?!= JSON.stringify(appUrl) ?>;\nconst frame=document.getElementById('app'),origin=new URL(appUrl).origin;\nconst channel=Array.from(crypto.getRandomValues(new Uint8Array(24)),n=>n.toString(16).padStart(2,'0')).join('');\nconst source=new URL(appUrl);source.searchParams.set('financeChannel',channel);source.searchParams.set('financeParent',location.origin);\nlet queue=Promise.resolve();\nfunction send(value){frame.contentWindow.postMessage({...value,channel},origin)}\naddEventListener('message',event=>{\n if(event.source!==frame.contentWindow||event.origin!==origin||event.data?.channel!==channel)return;\n const message=event.data;\n if(message.type==='finance:hello'){document.getElementById('status').hidden=true;send({type:'finance:ready'});return}\n if(message.type!=='finance:request'||typeof message.id!=='string')return;\n queue=queue.then(()=>new Promise(resolve=>{\n   google.script.run.withSuccessHandler(result=>{send({type:'finance:response',id:message.id,result});resolve()}).withFailureHandler(()=>{send({type:'finance:response',id:message.id,result:{ok:false,error:'Não foi possível acessar a planilha. Confira sua sessão Google e tente novamente.'}});resolve()}).financeApi(message.request);\n }));\n});\nframe.src=source.href;\n</script></body></html>\n";

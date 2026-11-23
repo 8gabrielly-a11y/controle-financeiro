@@ -1,0 +1,36 @@
+name: Publicar controle financeiro
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: finance-pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node controle/tests/sheets.test.cjs
+      - name: Preparar apenas o aplicativo, sem a versão antiga ou dados
+        run: |
+          mkdir -p _pages/controle
+          cp controle/index.html controle/config.js _pages/controle/
+          cp -R controle/app _pages/controle/app
+          cp controle/pages-index.html _pages/index.html
+          touch _pages/.nojekyll
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _pages
+      - name: Publicar
+        id: deployment
+        uses: actions/deploy-pages@v4

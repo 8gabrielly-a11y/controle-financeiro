@@ -1,0 +1,18 @@
+<!doctype html><html lang="pt-BR"><head><base target="_top"><meta name="viewport" content="width=device-width,initial-scale=1"><style>html,body{margin:0;height:100%;font:16px system-ui;background:#edf2f7}iframe{width:100%;height:100%;border:0}#status{padding:16px}#status[hidden]{display:none}</style></head><body><p id="status">Conectando à sua planilha…</p><iframe id="app" title="Controle financeiro" allow="clipboard-write"></iframe><script>
+const appUrl=<?!= JSON.stringify(appUrl) ?>;
+const frame=document.getElementById('app'),origin=new URL(appUrl).origin;
+const channel=Array.from(crypto.getRandomValues(new Uint8Array(24)),n=>n.toString(16).padStart(2,'0')).join('');
+const source=new URL(appUrl);source.searchParams.set('financeChannel',channel);source.searchParams.set('financeParent',location.origin);
+let queue=Promise.resolve();
+function send(value){frame.contentWindow.postMessage({...value,channel},origin)}
+addEventListener('message',event=>{
+ if(event.source!==frame.contentWindow||event.origin!==origin||event.data?.channel!==channel)return;
+ const message=event.data;
+ if(message.type==='finance:hello'){document.getElementById('status').hidden=true;send({type:'finance:ready'});return}
+ if(message.type!=='finance:request'||typeof message.id!=='string')return;
+ queue=queue.then(()=>new Promise(resolve=>{
+   google.script.run.withSuccessHandler(result=>{send({type:'finance:response',id:message.id,result});resolve()}).withFailureHandler(()=>{send({type:'finance:response',id:message.id,result:{ok:false,error:'Não foi possível acessar a planilha. Confira sua sessão Google e tente novamente.'}});resolve()}).financeApi(message.request);
+ }));
+});
+frame.src=source.href;
+</script></body></html>
