@@ -1,5 +1,11 @@
 name: Publicar controle financeiro
 on:
+  push:
+    branches: [main]
+    paths:
+      - 'controle/app/**'
+      - 'controle/config.js'
+      - '.github/workflows/finance-pages.yml'
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,7 +25,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - run: node controle/tests/sheets.test.cjs
+      - run: |
+          node controle/tests/sheets.test.cjs
+          node controle/tests/income-simulation.test.cjs
       - name: Preparar apenas o aplicativo, sem a versão antiga ou dados
         run: |
           mkdir -p _pages/controle

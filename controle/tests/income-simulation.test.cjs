@@ -1,0 +1,15 @@
+const fs=require('node:fs'),vm=require('node:vm'),assert=require('node:assert/strict');
+const app=__dirname+'/../app/',context=vm.createContext({window:{}});
+for(const name of ['statement.js','overview.js','income-simulation.js'])vm.runInContext(fs.readFileSync(app+name,'utf8'),context,{filename:name});
+const compare=context.window.FinanceIncomeSimulation.compare;
+const data={cash:100,cashKnown:true,cashDate:'2026-11-20',today:'2026-11-25',cards:[],records:[],receipts:[{nome:'Recarga Flash',valor_previsto:500,dia_recebimento:25,recorrencia:'monthly_variable',inicio:'2026-11',conta_id:'beneficio:flash',ativa:'true'}],bills:[{id:'rent',name:'Aluguel',amount:150,day:28,repeat:'monthly',month:'2026-11'}],payments:[],contributions:[]};
+const before=JSON.stringify(data);function freeze(x){Object.freeze(x);for(const v of Object.values(x))if(v&&typeof v==='object')freeze(v)}freeze(data);
+const once={name:'Trabalho extra',amount:75,month:'2026-11',repeat:'once'},monthly={name:'Possível bolsa',amount:25.25,month:'2026-12',repeat:'monthly'};
+let rows=compare(data,[once],'2026-11');assert.equal(rows[0].before,-50);assert.equal(rows[0].after,25);assert.equal(rows[1].improvement,75);assert.equal(rows[5].improvement,75,'one-time receipt is carried forward, not repeated');
+rows=compare(data,[monthly],'2026-11');assert.equal(rows[0].improvement,0);assert.equal(rows[1].improvement,25.25);assert.equal(rows[2].improvement,50.5);assert.equal(rows[5].improvement,126.25);
+rows=compare(data,[once,monthly],'2026-11');assert.equal(rows[2].improvement,125.5);assert.equal(rows[0].before,-50,'Flash does not become available cash');assert.equal(JSON.stringify(data),before,'simulation must not mutate financial data');
+assert.equal(compare({...data,cashKnown:false},[once],'2026-11')[0].after,null,'unknown cash remains unknown');
+assert.throws(()=>compare(data,[{...once,amount:-1}],'2026-11'));assert.throws(()=>compare(data,[{...once,month:'2026-10'}],'2026-11'));assert.throws(()=>compare(data,[{...once,amount:Infinity}],'2026-11'));
+for(const m of fs.readFileSync(app+'index.html','utf8').matchAll(/<script>([\s\S]*?)<\/script>/g))new vm.Script(m[1]);
+assert(!/FinanceRemote|FinanceBridge|fetch\(|localStorage|sessionStorage/.test(fs.readFileSync(app+'income-simulation.js','utf8')),'simulation must not call or persist real-data APIs');
+console.log('PASS: one-time/monthly and combined entries, cents, carry-forward, benefits excluded, unknown cash, validation, and no mutations or writes.');
