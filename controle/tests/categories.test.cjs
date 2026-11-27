@@ -1,0 +1,10 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');let rows=null,expenses=[{categoria:'Personalizada antiga'}];
+const sheet={getLastRow:()=>rows.length,setFrozenRows(){},appendRow:r=>rows.push(r),getRange:(row,col,count,width)=>({getValues:()=>rows.slice(row-1,row-1+count).map(r=>r.slice(col-1,col-1+width)),getDisplayValues:()=>rows.slice(row-1,row-1+count),setValues:values=>values.forEach((r,i)=>rows[row-1+i]=r)})};
+const context={SpreadsheetApp:{getActiveSpreadsheet:()=>({getSheetByName:()=>rows?sheet:null,insertSheet:()=>{rows=[];return sheet}}),flush(){}},readCollection_:()=>expenses,stableUUID:s=>s};vm.createContext(context);vm.runInContext(fs.readFileSync('controle/apps-script/Categories.gs','utf8'),context);const api=context.financeCategories_;
+assert(api({action:'list'}).records.some(x=>x.nome==='Personalizada antiga'));assert.equal(rows,null);
+const add=api({action:'save',name:'  Lazer  ',active:true}).record;assert.equal(add.nome,'Lazer');assert.equal(rows.length,2);
+assert.equal(api({action:'save',name:'LAZER',active:true}).record.id,add.id);assert.equal(rows.length,2);
+api({action:'save',name:'Lazer',active:false});assert.equal(api({action:'list'}).records.find(x=>x.nome==='Lazer').ativa,false);
+api({action:'save',name:'Alimentação',active:false});assert.equal(api({action:'list'}).records.find(x=>x.nome==='Alimentação').ativa,false);assert.equal(expenses[0].categoria,'Personalizada antiga');
+for(const name of ['','=SUM(1)', 'a'.repeat(61)])assert.throws(()=>api({action:'save',name,active:true}));
+console.log('PASS: default and historic categories, central persistence, deduplication, activation and validation.');

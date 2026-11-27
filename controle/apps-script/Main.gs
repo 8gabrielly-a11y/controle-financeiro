@@ -37,6 +37,7 @@ function financeApi(request){
       const counts={};Object.keys(COLLECTIONS).forEach(k=>counts[k]=readCollection_(k).length);
       return {ok:true,counts,source:'Google Sheets'};
     }
+    if(request.path==='/api/categories')return financeCategories_(request.body||{});
     if(request.path==='/api/sheets')return sheetRequest_(request.body||{});
     const env={DB:sheetDatabase_()};
     if(request.path==='/api/base-profile')return baseProfile(request.body||{},owner,env);

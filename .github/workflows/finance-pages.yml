@@ -27,6 +27,7 @@ jobs:
           node-version: '22'
       - run: |
           node controle/tests/sheets.test.cjs
+          node controle/tests/categories.test.cjs
           node controle/tests/income-simulation.test.cjs
       - name: Preparar apenas o aplicativo, sem a versão antiga ou dados
         run: |

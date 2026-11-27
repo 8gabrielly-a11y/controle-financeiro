@@ -236,6 +236,7 @@ function financeApi(request){
       const counts={};Object.keys(COLLECTIONS).forEach(k=>counts[k]=readCollection_(k).length);
       return {ok:true,counts,source:'Google Sheets'};
     }
+    if(request.path==='/api/categories')return financeCategories_(request.body||{});
     if(request.path==='/api/sheets')return sheetRequest_(request.body||{});
     const env={DB:sheetDatabase_()};
     if(request.path==='/api/base-profile')return baseProfile(request.body||{},owner,env);
@@ -314,3 +315,21 @@ function sheetDatabase_(){
 
 
 const FINANCE_BRIDGE_TEMPLATE_="<!doctype html><html lang=\"pt-BR\"><head><base target=\"_top\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><style>html,body{margin:0;height:100%;font:16px system-ui;background:#edf2f7}iframe{width:100%;height:100%;border:0}#status{padding:16px}#status[hidden]{display:none}</style></head><body><p id=\"status\">Conectando à sua planilha…</p><iframe id=\"app\" title=\"Controle financeiro\" allow=\"clipboard-write\"></iframe><script>\nconst appUrl=<?!= JSON.stringify(appUrl) ?>;\nconst frame=document.getElementById('app'),origin=new URL(appUrl).origin;\nconst channel=Array.from(crypto.getRandomValues(new Uint8Array(24)),n=>n.toString(16).padStart(2,'0')).join('');\nconst source=new URL(appUrl);source.searchParams.set('financeChannel',channel);source.searchParams.set('financeParent',location.origin);\nlet queue=Promise.resolve();\nfunction send(value){frame.contentWindow.postMessage({...value,channel},origin)}\naddEventListener('message',event=>{\n if(event.source!==frame.contentWindow||event.origin!==origin||event.data?.channel!==channel)return;\n const message=event.data;\n if(message.type==='finance:hello'){document.getElementById('status').hidden=true;send({type:'finance:ready'});return}\n if(message.type!=='finance:request'||typeof message.id!=='string')return;\n queue=queue.then(()=>new Promise(resolve=>{\n   google.script.run.withSuccessHandler(result=>{send({type:'finance:response',id:message.id,result});resolve()}).withFailureHandler(()=>{send({type:'finance:response',id:message.id,result:{ok:false,error:'Não foi possível acessar a planilha. Confira sua sessão Google e tente novamente.'}});resolve()}).financeApi(message.request);\n }));\n});\nframe.src=source.href;\n</script></body></html>\n";
+
+/* Category preferences are stored separately from financial transactions. */
+function financeCategories_(input){
+  const defaults=['Alimentação','Moradia','Transporte','Saúde','Educação','Outros','Seguros','Encargos','Saldo anterior','Pagamento de fatura'];
+  const key=name=>name.normalize('NFC').toLocaleLowerCase('pt-BR');
+  const spreadsheet=SpreadsheetApp.getActiveSpreadsheet();let sheet=spreadsheet.getSheetByName('Categorias');
+  const headers=['id','nome','ativa'];
+  if(sheet&&sheet.getRange(1,1,1,3).getDisplayValues()[0].some((v,i)=>v!==headers[i]))throw Error('Confira os cabeçalhos da aba Categorias.');
+  const saved=sheet&&sheet.getLastRow()>1?sheet.getRange(2,1,sheet.getLastRow()-1,3).getValues().filter(r=>r[0]).map(r=>({id:String(r[0]),nome:String(r[1]),ativa:r[2]!==false&&r[2]!=='false'})):[];
+  const all=new Map();for(const name of [...defaults,...readCollection_('lancamentos').map(r=>String(r.categoria||'').trim()).filter(Boolean)]){if(!all.has(key(name)))all.set(key(name),{id:stableUUID('category|'+key(name)),nome:name,ativa:true})}for(const item of saved)all.set(key(item.nome),item);
+  if(input.action==='list')return {ok:true,records:[...all.values()]};
+  if(input.action!=='save'||typeof input.name!=='string'||typeof input.active!=='boolean')throw Error('Categoria inválida.');
+  const name=input.name.normalize('NFC').trim().replace(/\s+/g,' ');if(!name||name.length>60||/[\x00-\x1f]/.test(input.name)||/^[=+@-]/.test(name))throw Error('Use um nome de até 60 caracteres, sem fórmulas.');
+  const existing=all.get(key(name)),item={id:existing?.id||stableUUID('category|'+key(name)),nome:existing?.nome||name,ativa:input.active};
+  if(!sheet){sheet=spreadsheet.insertSheet('Categorias');sheet.getRange(1,1,1,3).setValues([headers]);sheet.setFrozenRows(1)}
+  const index=saved.findIndex(r=>r.id===item.id),values=[[item.id,item.nome,item.ativa?'true':'false']];if(index<0)sheet.appendRow(values[0]);else sheet.getRange(index+2,1,1,3).setValues(values);
+  SpreadsheetApp.flush();return {ok:true,record:item,sheetSynced:true};
+}

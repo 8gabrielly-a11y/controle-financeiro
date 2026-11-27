@@ -1,6 +1,6 @@
 /* Navigation changes visibility only; financial data and forms stay mounted. */
 (()=>{'use strict';
- const modules={overview:{title:'Visão geral',panels:[]},money:{title:'Meu dinheiro',panels:['settings-money']},bills:{title:'Contas e pagamentos',panels:['settings-bills','settings-payments']},cards:{title:'Cartões e faturas',panels:['settings-cards']},goals:{title:'Cofrinhos',panels:['settings-goals']},simulations:{title:'Simulações',panels:['settings-income-simulation','settings-purchase','settings-loan']}};
+ const modules={settings:{title:'Configurações',panels:['settings-categories']},overview:{title:'Visão geral',panels:[]},money:{title:'Meu dinheiro',panels:['settings-money']},bills:{title:'Contas e pagamentos',panels:['settings-bills','settings-payments']},cards:{title:'Cartões e faturas',panels:['settings-cards']},goals:{title:'Cofrinhos',panels:['settings-goals']},simulations:{title:'Simulações',panels:['settings-income-simulation','settings-purchase','settings-loan']}};
  const buttons=[...document.querySelectorAll('[data-module]')];
  const panels=[...document.querySelectorAll('#plan > .card')].filter(x=>x.id!=='syncNotice');let current='overview';
  function select(name){
@@ -18,6 +18,6 @@
  }
  window.financeSetModule=select;window.financeOpenModule=open;
  for(const button of buttons)button.onclick=()=>open(button.dataset.module);
- document.getElementById('navPlan').onclick=()=>open(current==='overview'?'money':current);
+ document.getElementById('navPlan').onclick=()=>open('settings');
  open('overview');
 })();
