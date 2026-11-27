@@ -5,6 +5,7 @@
  const panels=[...document.querySelectorAll('#plan > .card')].filter(x=>x.id!=='syncNotice');let current='overview';
  function select(name){
   if(name===undefined)return;
+  document.getElementById("mobileModule").value=name||"";
   for(const button of buttons){if(button.dataset.module===name)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current')}
   if(name&&modules[name])current=name;
  }
@@ -16,6 +17,7 @@
   if(name==='simulations'){const simulation=document.getElementById('incomeSimulationPanel');if(simulation)simulation.open=true}
   window.scrollTo({top:0,behavior:'instant'});
  }
+ document.getElementById("mobileModule").onchange=e=>{if(e.target.value)open(e.target.value)};
  window.financeSetModule=select;window.financeOpenModule=open;
  for(const button of buttons)button.onclick=()=>open(button.dataset.module);
  document.getElementById('navPlan').onclick=()=>open('settings');

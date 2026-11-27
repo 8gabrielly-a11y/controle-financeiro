@@ -25,7 +25,7 @@ function doGet(){
   owner_();
   const template=HtmlService.createTemplateFromFile('Bridge');
   template.appUrl=appUrl_();
-  return template.evaluate().setTitle('Controle financeiro · Bia');
+  return template.evaluate().addMetaTag('viewport','width=device-width, initial-scale=1, viewport-fit=cover').setTitle('Controle financeiro · Bia');
 }
 function financeApi(request){
   const owner=owner_();
