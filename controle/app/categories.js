@@ -11,5 +11,5 @@
  async function load(){if(busy)return;busy=true;$('retryCategories').classList.add('hidden');try{const result=await request({action:'list'});categories=result.records;loaded=true;$('categoryStatus').textContent='Ative as categorias que deseja usar.'}catch{ $('categoryStatus').textContent='Não foi possível carregar suas categorias. Tente novamente após a conexão voltar.';$('retryCategories').classList.remove('hidden')}finally{busy=false;render()}}
  $('addCategory').onclick=()=>{const name=$('newCategoryName').value.trim().replace(/\s+/g,' ');if(!name||name.length>60||/^[=+@-]/.test(name)){$('categoryStatus').textContent='Informe um nome de até 60 caracteres, sem fórmulas.';return}save(name,true)};
  $('newCategoryName').onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();$('addCategory').click()}};$('retryCategories').onclick=load;
- window.FinanceCategories={ensure,refresh:options};window.addEventListener('finance:ready',load);if(FinanceRemote.connected)load();
+ window.FinanceCategories={ensure,refresh:()=>{if(loaded)options()}};window.addEventListener('finance:ready',load);if(FinanceRemote.connected)load();
 })();
